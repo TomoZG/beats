@@ -15,10 +15,14 @@ The module supports the following types of metrics:
 
     {applies_to}`stack: ga 9.6+` Aggregated until flushed (values reset, except the moving average rates).
 
+    {applies_to}`stack: ga 9.7+` `sum` is the total of the values received since the last flush. Like `count`, it is extrapolated from the sample rate.
+
 **Histogram (h)**
 :   Time measurement, alias for timer.
 
     {applies_to}`stack: ga 9.6+` Aggregated until flushed (values reset).
+
+    {applies_to}`stack: ga 9.7+` `sum` is the exact total of the values received since the last flush.
 
 **Set (s)**
 :   Measurement which counts unique occurrences until flushed (value set to 0).

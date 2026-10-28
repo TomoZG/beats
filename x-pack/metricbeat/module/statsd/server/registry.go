@@ -75,6 +75,10 @@ type samplingTimer struct {
 	// count is the number of measurements since the last flush, tracked here
 	// because the meter count is monotonic and cannot be reset.
 	count atomic.Int64
+	// sum is the total of the values received since the last flush, extrapolated
+	// like count. The histogram only keeps a bounded sample, so its sum is not
+	// exact.
+	sum float64
 }
 
 // NewSamplingTimer returns a new SamplingTimer
@@ -89,18 +93,23 @@ func newSamplingTimer() *samplingTimer {
 	}
 }
 
-// SampledUpdate will update the timer a sampled measurement
-func (s *samplingTimer) SampledUpdate(d time.Duration, sampleRate float64) {
-	s.histogram.Update(int64(d))
+// SampledUpdate will update the timer a sampled measurement. The count and the
+// sum are extrapolated from the sample rate, the histogram records the value
+// once, so sum/count only matches the mean while every measurement of the
+// timer uses the same sample rate.
+func (s *samplingTimer) SampledUpdate(v float64, sampleRate float64) {
+	s.histogram.Update(int64(v))
 	count := int64(1 / sampleRate)
 	s.meter.Mark(count)
 	s.count.Add(count)
+	s.sum += v * float64(count)
 }
 
 // Snapshot gets a snapshot of the SamplingTimer
 func (s *samplingTimer) Snapshot() samplingTimerSnapshot {
 	return samplingTimerSnapshot{
 		count:     s.count.Load(),
+		sum:       s.sum,
 		histogram: s.histogram.Snapshot(),
 		meter:     s.meter.Snapshot(),
 	}
@@ -111,11 +120,13 @@ func (s *samplingTimer) Snapshot() samplingTimerSnapshot {
 // time windows and are not tied to the interval.
 func (s *samplingTimer) Reset() {
 	s.count.Store(0)
+	s.sum = 0
 	s.histogram.Clear()
 }
 
 type samplingTimerSnapshot struct {
 	count     int64
+	sum       float64
 	histogram metrics.Histogram
 	meter     metrics.Meter
 }
@@ -171,8 +182,13 @@ func (t *samplingTimerSnapshot) StdDev() float64 { return t.histogram.StdDev() }
 // Stop is a no-op.
 func (t *samplingTimerSnapshot) Stop() {}
 
-// Sum returns the sum at the time the snapshot was taken.
+// Sum returns the sum of the sampled values at the time the snapshot was taken.
+// Use ExactSum for the total of every value received since the last flush.
 func (t *samplingTimerSnapshot) Sum() int64 { return t.histogram.Sum() }
+
+// ExactSum returns the total of the values received since the last flush at
+// the time the snapshot was taken.
+func (t *samplingTimerSnapshot) ExactSum() float64 { return t.sum }
 
 // Time panics.
 func (*samplingTimerSnapshot) Time(func()) {
@@ -194,6 +210,34 @@ func (t *samplingTimerSnapshot) Variance() float64 {
 	return t.histogram.Variance()
 }
 
+// summingHistogram is a histogram that also keeps the exact sum of the values
+// received since the last flush, which its bounded sample cannot provide.
+type summingHistogram struct {
+	metrics.Histogram
+	sum int64
+}
+
+func newSummingHistogram() *summingHistogram {
+	return &summingHistogram{
+		Histogram: metrics.NewHistogram(metrics.NewExpDecaySample(1028, 0.015)),
+	}
+}
+
+// Update records a value.
+func (h *summingHistogram) Update(v int64) {
+	h.Histogram.Update(v)
+	h.sum += v
+}
+
+// Clear resets the sample and the sum.
+func (h *summingHistogram) Clear() {
+	h.Histogram.Clear()
+	h.sum = 0
+}
+
+// ExactSum returns the total of the values received since the last flush.
+func (h *summingHistogram) ExactSum() int64 { return h.sum }
+
 type metricsGroup struct {
 	tags    map[string]string
 	metrics mapstr.M
@@ -211,7 +255,7 @@ func (r *registry) getMetric(metric any) map[string]any {
 		m.Clear()
 	case *deltaGaugeMetric:
 		values["value"] = m.Value()
-	case metrics.Histogram:
+	case *summingHistogram:
 		h := m.Snapshot()
 		if h.Count() == 0 {
 			// Reporting the aggregates of an empty sample would only add
@@ -220,6 +264,7 @@ func (r *registry) getMetric(metric any) map[string]any {
 		}
 		ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
 		values["count"] = h.Count()
+		values["sum"] = m.ExactSum()
 		values["min"] = h.Min()
 		values["max"] = h.Max()
 		values["mean"] = h.Mean()
@@ -240,6 +285,7 @@ func (r *registry) getMetric(metric any) map[string]any {
 		}
 		ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
 		values["count"] = t.Count()
+		values["sum"] = t.ExactSum()
 		values["min"] = t.Min()
 		values["max"] = t.Max()
 		values["mean"] = t.Mean()
@@ -393,8 +439,8 @@ func (r *registry) GetOrNewGauge64(name string, tags map[string]string) *deltaGa
 	return r.GetOrNewGauge64(name, tags)
 }
 
-func (r *registry) GetOrNewHistogram(name string, tags map[string]string) metrics.Histogram {
-	histogram, ok := r.getOrNew(name, tags, func() any { return metrics.NewHistogram(metrics.NewExpDecaySample(1028, 0.015)) }).(metrics.Histogram)
+func (r *registry) GetOrNewHistogram(name string, tags map[string]string) *summingHistogram {
+	histogram, ok := r.getOrNew(name, tags, func() any { return newSummingHistogram() }).(*summingHistogram)
 	if ok {
 		return histogram
 	}

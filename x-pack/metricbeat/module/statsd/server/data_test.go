@@ -6,6 +6,7 @@ package server
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1511,6 +1512,78 @@ func TestHistogramReset(t *testing.T) {
 	assert.Empty(t, ms.getEvents(), "a histogram that received no new measurements must not be reported")
 	assert.Same(t, histogram, ms.processor.registry.GetOrNewHistogram("metric01", nil),
 		"the histogram must stay in the registry across the idle flush")
+}
+
+// TestSum checks that timers and histograms report the exact total of the
+// values received in each flush interval.
+func TestSum(t *testing.T) {
+	// more values than the 1028 entry sample can hold, so only an exact sum
+	// gets 1+2+...+2000 right
+	var timerAboveSample, histogramAboveSample []string
+	for i := 1; i <= 2000; i++ {
+		timerAboveSample = append(timerAboveSample, "metric01:"+strconv.Itoa(i)+"|ms")
+		histogramAboveSample = append(histogramAboveSample, "metric01:"+strconv.Itoa(i)+"|h")
+	}
+
+	tests := []struct {
+		name    string
+		flushes [][]string
+		want    []any
+	}{
+		{
+			name:    "timer resets on every flush",
+			flushes: [][]string{{"metric01:10|ms", "metric01:15|ms"}, {"metric01:20|ms", "metric01:25|ms"}},
+			want:    []any{25.0, 45.0},
+		},
+		{
+			name:    "timer keeps fractional values",
+			flushes: [][]string{{"metric01:1.5|ms", "metric01:2.25|ms"}},
+			want:    []any{3.75},
+		},
+		{
+			name:    "timer sum is extrapolated from the sample rate",
+			flushes: [][]string{{"metric01:2|ms|@0.1"}},
+			want:    []any{20.0},
+		},
+		{
+			name:    "timer sum is extrapolated like the truncated count",
+			flushes: [][]string{{"metric01:2|ms|@0.3"}},
+			want:    []any{6.0},
+		},
+		{
+			name:    "timer sums more values than its sample holds",
+			flushes: [][]string{timerAboveSample},
+			want:    []any{2001000.0},
+		},
+		{
+			name:    "histogram resets on every flush",
+			flushes: [][]string{{"metric01:10|h", "metric01:15|h"}, {"metric01:20|h", "metric01:25|h"}},
+			want:    []any{int64(25), int64(45)},
+		},
+		{
+			name:    "histogram sums more values than its sample holds",
+			flushes: [][]string{histogramAboveSample},
+			want:    []any{int64(2001000)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := newStatsdMetricSet(t, map[string]any{"module": "statsd"})
+
+			for i, packets := range tc.flushes {
+				err := process(packets, ms)
+				require.NoError(t, err, "the packets of flush %d must be accepted", i)
+
+				events := ms.getEvents()
+				require.Len(t, events, 1, "the metric received measurements in flush %d, so it must be reported", i)
+				assert.Equal(t, tc.want[i], metricValues(t, events[0].MetricSetFields, "metric01")["sum"],
+					"sum of flush %d must be the exact total of the values received since the previous flush", i)
+			}
+
+			assert.Empty(t, ms.getEvents(), "a metric that received no new measurements must not be reported")
+		})
+	}
 }
 
 // TestIdleTimerDoesNotMaskOtherMetrics makes sure that an idle timer is skipped

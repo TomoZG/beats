@@ -219,7 +219,7 @@ func (p *metricProcessor) processSingle(m statsdMetric) error {
 		if err != nil {
 			return fmt.Errorf("failed to process timer `%s` with value `%s`: %w", m.name, m.value, err)
 		}
-		c.SampledUpdate(time.Duration(v), sampleRate)
+		c.SampledUpdate(v, sampleRate)
 	case "h": // TODO: can these be floats?
 		c := p.registry.GetOrNewHistogram(m.name, m.tags)
 		v, err := strconv.ParseInt(m.value, 10, 64)
